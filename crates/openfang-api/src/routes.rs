@@ -9754,18 +9754,17 @@ pub async fn clone_agent(
         }
     };
 
-    // Copy workspace files from source to destination
+    // Copy identity files from source agent dir to destination agent dir
     let new_entry = state.kernel.registry.get(new_id);
-    if let (Some(ref src_ws), Some(ref new_entry)) = (source.manifest.workspace, new_entry) {
-        if let Some(ref dst_ws) = new_entry.manifest.workspace {
-            // Security: canonicalize both paths
-            if let (Ok(src_can), Ok(dst_can)) = (src_ws.canonicalize(), dst_ws.canonicalize()) {
-                for &fname in KNOWN_IDENTITY_FILES {
-                    let src_file = src_can.join(fname);
-                    let dst_file = dst_can.join(fname);
-                    if src_file.exists() {
-                        let _ = std::fs::copy(&src_file, &dst_file);
-                    }
+    if let Some(ref new_entry) = new_entry {
+        let src_dir = agent_files_dir(&state.kernel, &source.name);
+        let dst_dir = agent_files_dir(&state.kernel, &new_entry.name);
+        if let (Ok(src_can), Ok(dst_can)) = (src_dir.canonicalize(), dst_dir.canonicalize()) {
+            for &fname in KNOWN_IDENTITY_FILES {
+                let src_file = src_can.join(fname);
+                let dst_file = dst_can.join(fname);
+                if src_file.exists() {
+                    let _ = std::fs::copy(&src_file, &dst_file);
                 }
             }
         }
@@ -9807,6 +9806,10 @@ const KNOWN_IDENTITY_FILES: &[&str] = &[
     "HEARTBEAT.md",
 ];
 
+fn agent_files_dir(kernel: &OpenFangKernel, agent_name: &str) -> std::path::PathBuf {
+    kernel.config.home_dir.join("agents").join(agent_name)
+}
+
 /// GET /api/agents/{id}/files — List workspace identity files.
 pub async fn list_agent_files(
     State(state): State<Arc<AppState>>,
@@ -9832,15 +9835,7 @@ pub async fn list_agent_files(
         }
     };
 
-    let workspace = match entry.manifest.workspace {
-        Some(ref ws) => ws.clone(),
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "Agent has no workspace"})),
-            );
-        }
-    };
+    let workspace = agent_files_dir(&state.kernel, &entry.name);
 
     let mut files = Vec::new();
     for &name in KNOWN_IDENTITY_FILES {
@@ -9894,15 +9889,7 @@ pub async fn get_agent_file(
         }
     };
 
-    let workspace = match entry.manifest.workspace {
-        Some(ref ws) => ws.clone(),
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "Agent has no workspace"})),
-            );
-        }
-    };
+    let workspace = agent_files_dir(&state.kernel, &entry.name);
 
     // Security: canonicalize and verify stays inside workspace
     let file_path = workspace.join(&filename);
@@ -10001,15 +9988,14 @@ pub async fn set_agent_file(
         }
     };
 
-    let workspace = match entry.manifest.workspace {
-        Some(ref ws) => ws.clone(),
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "Agent has no workspace"})),
-            );
-        }
-    };
+    let workspace = agent_files_dir(&state.kernel, &entry.name);
+
+    if let Err(e) = std::fs::create_dir_all(&workspace) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Agent files directory error: {e}")})),
+        );
+    }
 
     // Security: verify workspace path and target stays inside it
     let ws_canonical = match workspace.canonicalize() {

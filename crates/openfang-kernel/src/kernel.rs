@@ -300,6 +300,10 @@ fn ensure_workspace(workspace: &Path) -> KernelResult<()> {
     Ok(())
 }
 
+fn agent_files_dir(home_dir: &Path, agent_name: &str) -> PathBuf {
+    home_dir.join("agents").join(agent_name)
+}
+
 /// Generate workspace identity files for an agent (SOUL.md, USER.md, TOOLS.md, MEMORY.md).
 /// Uses `create_new` to never overwrite existing files (preserves user edits).
 fn generate_identity_files(workspace: &Path, manifest: &AgentManifest) {
@@ -1197,24 +1201,10 @@ impl OpenFangKernel {
                                 ) {
                                     Ok(disk_manifest) => {
                                         // Compare key fields to detect changes
-                                        let changed = disk_manifest.name != entry.manifest.name
-                                            || disk_manifest.description
-                                                != entry.manifest.description
-                                            || disk_manifest.model.system_prompt
-                                                != entry.manifest.model.system_prompt
-                                            || disk_manifest.model.provider
-                                                != entry.manifest.model.provider
-                                            || disk_manifest.model.model
-                                                != entry.manifest.model.model
-                                            || disk_manifest.capabilities.tools
-                                                != entry.manifest.capabilities.tools
-                                            || disk_manifest.tool_allowlist
-                                                != entry.manifest.tool_allowlist
-                                            || disk_manifest.tool_blocklist
-                                                != entry.manifest.tool_blocklist
-                                            || disk_manifest.skills != entry.manifest.skills
-                                            || disk_manifest.mcp_servers
-                                                != entry.manifest.mcp_servers;
+                                        let changed = manifest_differs_for_disk_override(
+                                            &disk_manifest,
+                                            &entry.manifest,
+                                        );
                                         if changed {
                                             info!(
                                                 agent = %name,
@@ -1473,14 +1463,30 @@ impl OpenFangKernel {
         // Apply global budget defaults to agent resource quotas
         apply_budget_defaults(&self.config.budget, &mut manifest.resources);
 
-        // Create workspace directory for the agent (name-based, so SOUL.md survives recreation)
+        // Create managed workspace structure only for internal OpenFang workspaces.
+        // External/custom workspaces are treated as user-owned directories.
+        let managed_workspaces_root = self.config.effective_workspaces_dir();
         let workspace_dir = manifest
             .workspace
             .clone()
-            .unwrap_or_else(|| self.config.effective_workspaces_dir().join(&name));
-        ensure_workspace(&workspace_dir)?;
+            .unwrap_or_else(|| managed_workspaces_root.join(&name));
+        if workspace_dir.starts_with(&managed_workspaces_root) {
+            ensure_workspace(&workspace_dir)?;
+        } else if !workspace_dir.exists() || !workspace_dir.is_dir() {
+            return Err(KernelError::OpenFang(OpenFangError::InvalidInput(format!(
+                "Custom workspace must be an existing directory: {}",
+                workspace_dir.display()
+            ))));
+        }
         if manifest.generate_identity_files {
-            generate_identity_files(&workspace_dir, &manifest);
+            let identity_dir = agent_files_dir(&self.config.home_dir, &name);
+            std::fs::create_dir_all(&identity_dir).map_err(|e| {
+                KernelError::OpenFang(OpenFangError::Internal(format!(
+                    "Failed to create agent files dir {}: {e}",
+                    identity_dir.display()
+                )))
+            })?;
+            generate_identity_files(&identity_dir, &manifest);
         }
         manifest.workspace = Some(workspace_dir);
 
@@ -1953,6 +1959,7 @@ impl OpenFangKernel {
                 })
                 .collect();
 
+            let identity_dir = agent_files_dir(&self.config.home_dir, &manifest.name);
             let prompt_ctx = openfang_runtime::prompt_builder::PromptContext {
                 agent_name: manifest.name.clone(),
                 agent_description: manifest.description.clone(),
@@ -1970,18 +1977,9 @@ impl OpenFangKernel {
                     String::new()
                 },
                 workspace_path: manifest.workspace.as_ref().map(|p| p.display().to_string()),
-                soul_md: manifest
-                    .workspace
-                    .as_ref()
-                    .and_then(|w| read_identity_file(w, "SOUL.md")),
-                user_md: manifest
-                    .workspace
-                    .as_ref()
-                    .and_then(|w| read_identity_file(w, "USER.md")),
-                memory_md: manifest
-                    .workspace
-                    .as_ref()
-                    .and_then(|w| read_identity_file(w, "MEMORY.md")),
+                soul_md: read_identity_file(&identity_dir, "SOUL.md"),
+                user_md: read_identity_file(&identity_dir, "USER.md"),
+                memory_md: read_identity_file(&identity_dir, "MEMORY.md"),
                 canonical_context: self
                     .memory
                     .canonical_context(agent_id, None)
@@ -1995,28 +1993,16 @@ impl OpenFangKernel {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
                 is_autonomous: manifest.autonomous.is_some(),
-                agents_md: manifest
-                    .workspace
-                    .as_ref()
-                    .and_then(|w| read_identity_file(w, "AGENTS.md")),
-                bootstrap_md: manifest
-                    .workspace
-                    .as_ref()
-                    .and_then(|w| read_identity_file(w, "BOOTSTRAP.md")),
+                agents_md: read_identity_file(&identity_dir, "AGENTS.md"),
+                bootstrap_md: read_identity_file(&identity_dir, "BOOTSTRAP.md"),
                 workspace_context: manifest.workspace.as_ref().map(|w| {
                     let mut ws_ctx =
                         openfang_runtime::workspace_context::WorkspaceContext::detect(w);
                     ws_ctx.build_context_section()
                 }),
-                identity_md: manifest
-                    .workspace
-                    .as_ref()
-                    .and_then(|w| read_identity_file(w, "IDENTITY.md")),
+                identity_md: read_identity_file(&identity_dir, "IDENTITY.md"),
                 heartbeat_md: if manifest.autonomous.is_some() {
-                    manifest
-                        .workspace
-                        .as_ref()
-                        .and_then(|w| read_identity_file(w, "HEARTBEAT.md"))
+                    read_identity_file(&identity_dir, "HEARTBEAT.md")
                 } else {
                     None
                 },
@@ -2520,6 +2506,7 @@ impl OpenFangKernel {
                 })
                 .collect();
 
+            let identity_dir = agent_files_dir(&self.config.home_dir, &manifest.name);
             let prompt_ctx = openfang_runtime::prompt_builder::PromptContext {
                 agent_name: manifest.name.clone(),
                 agent_description: manifest.description.clone(),
@@ -2537,18 +2524,9 @@ impl OpenFangKernel {
                     String::new()
                 },
                 workspace_path: manifest.workspace.as_ref().map(|p| p.display().to_string()),
-                soul_md: manifest
-                    .workspace
-                    .as_ref()
-                    .and_then(|w| read_identity_file(w, "SOUL.md")),
-                user_md: manifest
-                    .workspace
-                    .as_ref()
-                    .and_then(|w| read_identity_file(w, "USER.md")),
-                memory_md: manifest
-                    .workspace
-                    .as_ref()
-                    .and_then(|w| read_identity_file(w, "MEMORY.md")),
+                soul_md: read_identity_file(&identity_dir, "SOUL.md"),
+                user_md: read_identity_file(&identity_dir, "USER.md"),
+                memory_md: read_identity_file(&identity_dir, "MEMORY.md"),
                 canonical_context: self
                     .memory
                     .canonical_context(agent_id, None)
@@ -2562,28 +2540,16 @@ impl OpenFangKernel {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
                 is_autonomous: manifest.autonomous.is_some(),
-                agents_md: manifest
-                    .workspace
-                    .as_ref()
-                    .and_then(|w| read_identity_file(w, "AGENTS.md")),
-                bootstrap_md: manifest
-                    .workspace
-                    .as_ref()
-                    .and_then(|w| read_identity_file(w, "BOOTSTRAP.md")),
+                agents_md: read_identity_file(&identity_dir, "AGENTS.md"),
+                bootstrap_md: read_identity_file(&identity_dir, "BOOTSTRAP.md"),
                 workspace_context: manifest.workspace.as_ref().map(|w| {
                     let mut ws_ctx =
                         openfang_runtime::workspace_context::WorkspaceContext::detect(w);
                     ws_ctx.build_context_section()
                 }),
-                identity_md: manifest
-                    .workspace
-                    .as_ref()
-                    .and_then(|w| read_identity_file(w, "IDENTITY.md")),
+                identity_md: read_identity_file(&identity_dir, "IDENTITY.md"),
                 heartbeat_md: if manifest.autonomous.is_some() {
-                    manifest
-                        .workspace
-                        .as_ref()
-                        .and_then(|w| read_identity_file(w, "HEARTBEAT.md"))
+                    read_identity_file(&identity_dir, "HEARTBEAT.md")
                 } else {
                     None
                 },
@@ -3018,7 +2984,7 @@ impl OpenFangKernel {
     /// propagate as an error — the authoritative copy lives in SQLite.
     pub fn persist_manifest_to_disk(&self, agent_id: AgentId) {
         if let Some(entry) = self.registry.get(agent_id) {
-            let dir = self.config.home_dir.join("agents").join(&entry.name);
+            let dir = agent_files_dir(&self.config.home_dir, &entry.name);
             let toml_path = dir.join("agent.toml");
             match toml::to_string_pretty(&entry.manifest) {
                 Ok(toml_str) => {
@@ -6149,6 +6115,23 @@ fn apply_budget_defaults(
     }
 }
 
+fn manifest_differs_for_disk_override(
+    disk_manifest: &AgentManifest,
+    stored_manifest: &AgentManifest,
+) -> bool {
+    disk_manifest.name != stored_manifest.name
+        || disk_manifest.description != stored_manifest.description
+        || disk_manifest.model.system_prompt != stored_manifest.model.system_prompt
+        || disk_manifest.model.provider != stored_manifest.model.provider
+        || disk_manifest.model.model != stored_manifest.model.model
+        || disk_manifest.capabilities.tools != stored_manifest.capabilities.tools
+        || disk_manifest.tool_allowlist != stored_manifest.tool_allowlist
+        || disk_manifest.tool_blocklist != stored_manifest.tool_blocklist
+        || disk_manifest.skills != stored_manifest.skills
+        || disk_manifest.mcp_servers != stored_manifest.mcp_servers
+        || disk_manifest.workspace != stored_manifest.workspace
+}
+
 /// Pick a sensible default embedding model for a given provider when the user
 /// configured an explicit `embedding_provider` but left `embedding_model` at the
 /// default value (which is a local model name that cloud APIs wouldn't recognise).
@@ -7264,6 +7247,18 @@ mod tests {
         assert_eq!(caps.len(), 3); // 2 tools + agent_spawn
     }
 
+    #[test]
+    fn test_manifest_differs_for_disk_override_includes_workspace() {
+        let mut stored = AgentManifest::default();
+        stored.name = "agent".to_string();
+        stored.workspace = Some(std::path::PathBuf::from("/tmp/original"));
+
+        let mut disk = stored.clone();
+        disk.workspace = Some(std::path::PathBuf::from("/tmp/custom"));
+
+        assert!(manifest_differs_for_disk_override(&disk, &stored));
+    }
+
     fn test_manifest(name: &str, description: &str, tags: Vec<String>) -> AgentManifest {
         AgentManifest {
             name: name.to_string(),
@@ -7689,6 +7684,49 @@ mod tests {
             .structured_get(shared, "__openfang_schedules_migrated_v1")
             .unwrap();
         assert_eq!(marker, Some(serde_json::Value::Bool(true)));
+
+        kernel.shutdown();
+    }
+
+    #[test]
+    fn test_custom_workspace_keeps_identity_files_in_agent_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home_dir = tmp.path().join("openfang-kernel-custom-workspace-test");
+        let custom_workspace = tmp.path().join("Documents");
+        std::fs::create_dir_all(&home_dir).unwrap();
+        std::fs::create_dir_all(&custom_workspace).unwrap();
+
+        let config = KernelConfig {
+            home_dir: home_dir.clone(),
+            data_dir: home_dir.join("data"),
+            ..KernelConfig::default()
+        };
+
+        let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
+
+        let manifest = AgentManifest {
+            name: "docs-agent".to_string(),
+            workspace: Some(custom_workspace.clone()),
+            ..Default::default()
+        };
+
+        let agent_id = kernel.spawn_agent(manifest).expect("Agent should spawn");
+        let entry = kernel
+            .registry
+            .get(agent_id)
+            .expect("agent should be registered");
+
+        assert_eq!(entry.manifest.workspace.as_deref(), Some(custom_workspace.as_path()));
+
+        let identity_dir = home_dir.join("agents").join("docs-agent");
+        assert!(
+            identity_dir.join("SOUL.md").exists(),
+            "SOUL.md should be generated in agent dir"
+        );
+        assert!(
+            !custom_workspace.join("SOUL.md").exists(),
+            "SOUL.md should not be generated in external workspace"
+        );
 
         kernel.shutdown();
     }
